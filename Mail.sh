@@ -2,9 +2,9 @@
 
 # Konfigurasi
 domain="oci.com"
-ip_public="103.176.79.123"
-reverse_ip="79.176.103"
-last_octet="123"
+ip_public="103.174.114.75"
+reverse_ip="114.174.103"
+last_octet="75"
 hostname="mail.$domain"
 
 # Update dan install dependency
