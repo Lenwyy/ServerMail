@@ -1,119 +1,110 @@
 #!/bin/bash
 
-set -e
-
+# Konfigurasi
 domain="oci.com"
 ip_public="103.176.79.123"
 reverse_ip="79.176.103"
 last_octet="123"
 hostname="mail.$domain"
 
-echo "[1/10] Update sistem"
+# Update dan install dependency
+echo "[+] Update dan install paket awal..."
 apt update && apt upgrade -y
+apt install -y software-properties-common debconf-utils wget gnupg curl nano
 
-echo "[2/10] Instalasi paket yang dibutuhkan"
-apt install -y bind9 dnsutils postfix dovecot-imapd apache2 php mariadb-server openssl composer \
-php-net-smtp php-mysql php-gd php-xml php-mbstring php-intl php-zip php-json php-pear php-bz2 php-gmp \
-php-imap php-imagick php-auth-sasl php-mail-mime php-net-ldap3 php-net-sieve php-curl libapache2-mod-php curl
+# Set hostname
+echo "[+] Set hostname ke $hostname..."
+hostnamectl set-hostname $hostname
+echo "$ip_public $hostname" >> /etc/hosts
 
-echo "[3/10] Konfigurasi DNS Zone untuk $domain"
-cp /etc/bind/db.local /etc/bind/db.$domain
-cp /etc/bind/db.127 /etc/bind/db.$reverse_ip
+# Preseed konfigurasi Postfix
+echo "[+] Konfigurasi otomatis Postfix..."
+echo "postfix postfix/mailname string $hostname" | debconf-set-selections
+echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
 
-cat > /etc/bind/db.$domain <<EOF
-\$TTL 604800
-@   IN  SOA ns.$domain. root.$domain. (
-        2       ; Serial
-        604800  ; Refresh
-        86400   ; Retry
-        2419200 ; Expire
-        604800 ) ; Negative Cache TTL
-;
-@       IN      NS      ns.$domain.
-@       IN      A       $ip_public
-ns      IN      A       $ip_public
-mail    IN      A       $ip_public
-@       IN      MX 10   mail.$domain.
+# Install Postfix dan Dovecot tanpa interaktif
+echo "[+] Install Postfix dan Dovecot..."
+DEBIAN_FRONTEND=noninteractive apt install -y postfix dovecot-core dovecot-imapd
+
+# Konfigurasi Postfix
+echo "[+] Konfigurasi Postfix..."
+postconf -e "myhostname = $hostname"
+postconf -e "mydomain = $domain"
+postconf -e "myorigin = \$mydomain"
+postconf -e "inet_interfaces = all"
+postconf -e "inet_protocols = ipv4"
+postconf -e "mydestination = \$myhostname, localhost.\$mydomain, localhost, \$mydomain"
+postconf -e "home_mailbox = Maildir/"
+postconf -e "smtpd_banner = \$myhostname ESMTP \$mail_name"
+postconf -e "smtpd_tls_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem"
+postconf -e "smtpd_tls_key_file=/etc/ssl/private/ssl-cert-snakeoil.key"
+postconf -e "smtpd_use_tls=yes"
+postconf -e "smtpd_tls_session_cache_database = btree:\${data_directory}/smtpd_scache"
+postconf -e "smtp_tls_session_cache_database = btree:\${data_directory}/smtp_scache"
+
+# Buat user mail
+echo "[+] Membuat user oci dan leni..."
+useradd -m oci
+echo "oci:passwordoci" | chpasswd
+useradd -m leni
+echo "leni:passwordleni" | chpasswd
+
+# Buat folder Maildir untuk masing-masing user
+echo "[+] Membuat Maildir..."
+for user in oci leni; do
+  su - $user -c "mkdir -p ~/Maildir/{cur,new,tmp}"
+done
+
+# Konfigurasi Dovecot
+echo "[+] Konfigurasi Dovecot..."
+cat <<EOF > /etc/dovecot/dovecot.conf
+disable_plaintext_auth = no
+mail_privileged_group = mail
+mail_location = maildir:~/Maildir
+userdb {
+  driver = passwd
+}
+passdb {
+  driver = pam
+}
+protocols = imap pop3 lmtp
 EOF
 
-cat > /etc/bind/db.$reverse_ip <<EOF
+# Aktifkan dan restart layanan
+echo "[+] Restart layanan..."
+systemctl restart postfix
+systemctl restart dovecot
+systemctl enable postfix
+systemctl enable dovecot
+
+# Install Roundcube Webmail (via apt)
+echo "[+] Install Roundcube..."
+DEBIAN_FRONTEND=noninteractive apt install -y roundcube roundcube-core roundcube-mysql roundcube-plugins roundcube-plugins-extra
+
+# Konfigurasi Reverse DNS (contoh Bind9)
+echo "[+] Konfigurasi reverse DNS..."
+apt install -y bind9
+
+cat <<EOF > /etc/bind/db.$reverse_ip
 \$TTL 604800
 @   IN  SOA ns.$domain. root.$domain. (
-        1       ; Serial
-        604800  ; Refresh
-        86400   ; Retry
-        2419200 ; Expire
-        604800 ) ; Negative Cache TTL
-;
-@       IN      NS      ns
-$last_octet    IN      PTR     mail.$domain.
+            2         ; Serial
+            604800    ; Refresh
+            86400     ; Retry
+            2419200   ; Expire
+            604800 )  ; Negative Cache TTL
+
+@       IN  NS      ns.$domain.
+$last_octet  IN  PTR     mail.$domain.
 EOF
 
-echo "zone \"$domain\" {
-    type master;
-    file \"/etc/bind/db.$domain\";
-};
-
-zone \"$reverse_ip.in-addr.arpa\" {
+echo "zone \"$reverse_ip.in-addr.arpa\" {
     type master;
     file \"/etc/bind/db.$reverse_ip\";
 };" >> /etc/bind/named.conf.local
 
-echo "nameserver 127.0.0.1" > /etc/resolv.conf
 systemctl restart bind9
+systemctl enable bind9
 
-echo "[4/10] Konfigurasi Postfix"
-maildirmake.dovecot /etc/skel/Maildir
-postconf -e 'home_mailbox = Maildir/'
-
-echo "[5/10] Konfigurasi Dovecot"
-sed -i 's|^#mail_location =.*|mail_location = maildir:~/Maildir|' /etc/dovecot/conf.d/10-mail.conf
-sed -i 's|^#disable_plaintext_auth = yes|disable_plaintext_auth = no|' /etc/dovecot/conf.d/10-auth.conf
-sed -i 's|^auth_mechanisms =.*|auth_mechanisms = plain login|' /etc/dovecot/conf.d/10-auth.conf
-
-systemctl restart postfix dovecot
-
-echo "[6/10] Membuat user email"
-for user in oci leni; do
-  useradd -m $user
-  echo "$user:password" | chpasswd
-done
-
-echo "[7/10] Install Roundcube"
-wget https://github.com/roundcube/roundcubemail/releases/download/1.5.2/roundcubemail-1.5.2-complete.tar.gz
-mkdir -p /var/www/roundcube
-tar -xf roundcubemail-1.5.2-complete.tar.gz -C /var/www/roundcube --strip-components=1
-
-chown -R www-data:www-data /var/www/roundcube/
-chmod -R 775 /var/www/roundcube/
-
-echo "[8/10] Konfigurasi Apache untuk Roundcube"
-cat > /etc/apache2/sites-available/roundcube.conf <<EOF
-<VirtualHost *:80>
-    ServerName $hostname
-    DocumentRoot /var/www/roundcube/
-
-    ErrorLog \${APACHE_LOG_DIR}/roundcube_error.log
-    CustomLog \${APACHE_LOG_DIR}/roundcube_access.log combined
-
-    <Directory />
-        Options FollowSymLinks
-        AllowOverride All
-    </Directory>
-
-    <Directory /var/www/roundcube/>
-        Options FollowSymLinks MultiViews
-        AllowOverride All
-        Require all granted
-    </Directory>
-</VirtualHost>
-EOF
-
-a2ensite roundcube.conf
-a2enmod rewrite
-systemctl restart apache2
-
-echo "[9/10] Instalasi Selesai!"
-echo "Akses webmail: http://$hostname"
-echo "User: oci | Password: password"
-echo "User: leni | Password: password"
+echo "[✔] Mail server selesai dikonfigurasi!"
+echo "Akses Webmail: http://$ip_public/roundcube"
