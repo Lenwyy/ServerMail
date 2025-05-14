@@ -3,9 +3,9 @@
 set -e
 
 domain="oci.com"
-ip_public="150.150.150.150"
-reverse_ip="150.150.150"
-last_octet="150"
+ip_public="103.176.79.123"
+reverse_ip="79.176.103"
+last_octet="123"
 hostname="mail.$domain"
 
 echo "[1/10] Update sistem"
